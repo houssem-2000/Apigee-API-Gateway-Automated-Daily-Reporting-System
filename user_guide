@@ -1,0 +1,13 @@
+How to Deploy & Schedule the Apigee Daily Report
+
+1. Deploy the script
+Place apigee_daily_report.sh in your desired local path, for example:
+/home/apigee/scripts/apigee_daily_report.sh
+2. Grant execution permission
+Make the script executable by running:
+chmod +x /home/apigee/scripts/apigee_daily_report.sh
+3. Configure GCP Authentication
+The script authenticates automatically using a GCP Service Account key file. It activates the service account via gcloud, obtains a short-lived access token, and uses it to query the Apigee Stats API — no manual login required.
+4. Schedule daily execution via cron
+Open the crontab editor with crontab -e and add the following line to trigger the report every day at 9:00 AM:
+0 9 * * * /home/apigee/scripts/apigee_daily_report.sh
