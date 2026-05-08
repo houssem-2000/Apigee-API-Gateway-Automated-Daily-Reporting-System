@@ -1,0 +1,371 @@
+apigee@salapgbapp01 ~]$ cat apigee_report_auto.sh
+#!/bin/bash
+# ============================================================
+# Apigee Daily Report Script (UTC)
+# Generates per-proxy statistics (2xx, 4xx, 5xx, etc.)
+# Produces both HTML and CSV reports and sends via email.
+# ============================================================
+
+set -euo pipefail
+
+
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin"
+
+
+SA_KEY="/home/apigee/svc_key/xxxxxxxxxxx"   --- put the path of your service_account for connection with GCP 
+
+ACCESS_TOKEN=$(gcloud auth activate-service-account --key-file="$SA_KEY" >/dev/null && gcloud auth print-access-token) --- authentification to GCP to retrieve data
+
+
+
+# === DATE SETUP (UTC) ===
+YESTERDAY=$(date -u -d "yesterday" +"%m/%d/%Y 00:00")
+TODAY=$(date -u +"%m/%d/%Y 00:00")
+DATE_RANGE="$(date -u -d 'yesterday' +'%Y-%m-%d') to $(date -u +'%Y-%m-%d') (UTC)"
+TIME_RANGE="$YESTERDAY~$TODAY"
+
+# === TEMP FILES ===
+HTML_FILE=$(mktemp /tmp/apigee_report_XXXX.html)
+CSV_FILE=$(mktemp /tmp/apigee_report_XXXX.csv)
+STATUS_JSON=$(mktemp /tmp/apigee_status_XXXX.json)
+SUCCESS_JSON=$(mktemp /tmp/apigee_success_XXXX.json)
+ERROR_JSON=$(mktemp /tmp/apigee_error_XXXX.json)
+
+cleanup() {
+  echo "🧹 Cleaning up temporary files..."
+  rm -f "$HTML_FILE" "$CSV_FILE" "$STATUS_JSON" "$SUCCESS_JSON" "$ERROR_JSON"
+}
+trap cleanup EXIT
+
+# === Helper Functions ===
+_url_encode_spaces() { printf '%s' "$1" | sed 's/ /%20/g'; }
+
+fetch_generic() {
+  local url="$1"
+  curl -s -H "Authorization: Bearer $ACCESS_TOKEN" "$url"
+}
+
+fetch_totals() {
+  local range="$1" filter_q="$2" outfile="$3"
+  local url="https://apigee.googleapis.com/v1/organizations/oa-apigee-prod/environments/default-prod/stats/apiproxy?select=sum(message_count)&timeRange=$(_url_encode_spaces "$range")&timeUnit=day&filter=$(_url_encode_spaces "$filter_q")"
+  fetch_generic "$url" > "$outfile"
+}
+
+fetch_statuses() {
+  local range="$1" outfile="$2"
+  local url="https://apigee.googleapis.com/v1/organizations/oa-apigee-prod/environments/default-prod/stats/apiproxy,response_status_code?select=sum(message_count)&timeRange=$(_url_encode_spaces "$range")&timeUnit=day&limit=10000"
+  fetch_generic "$url" > "$outfile"
+}
+
+echo "👉 Fetching aggregated data from $TIME_RANGE..."
+echo "$DATE_RANGE"
+
+fetch_totals "$TIME_RANGE" "(response_status_code ge 200 and response_status_code le 299)" "$SUCCESS_JSON"
+fetch_totals "$TIME_RANGE" "(response_status_code ge 500 and response_status_code le 599)" "$ERROR_JSON"
+fetch_statuses "$TIME_RANGE" "$STATUS_JSON"
+
+# === Python: Parse JSON, Create CSV & HTML ===
+python3 - "$SUCCESS_JSON" "$ERROR_JSON" "$STATUS_JSON" "$DATE_RANGE" "$HTML_FILE" "$CSV_FILE" <<'PYTHON_SCRIPT'
+import sys
+import json
+import csv
+import collections
+import re
+import html as html_module
+
+succ_path, err_path, status_path = sys.argv[1:4]
+date_range, html_out, csv_out = sys.argv[4:7]
+
+def load_json(p):
+    try:
+        with open(p, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading {p}: {e}", file=sys.stderr)
+        return {}
+
+def iter_metrics(dim):
+    for key in ("metrics", "metric"):
+        if key in dim and isinstance(dim[key], list):
+            for m in dim[key]:
+                yield m
+
+def extract_totals(obj):
+    res = {}
+    for env in obj.get("environments", []):
+        for dim in env.get("dimensions", []):
+            proxy = dim.get("name") or "<unknown>"
+            total = 0
+            for m in iter_metrics(dim):
+                if m.get("name") == "sum(message_count)":
+                    for v in m.get("values", []):
+                        try:
+                            total += int(v.get("value", 0))
+                        except (ValueError, TypeError):
+                            pass
+            res[proxy] = res.get(proxy, 0) + total
+    return res
+
+def extract_status_matrix(obj):
+    """Extract status codes per proxy with robust type handling"""
+    matrix = collections.defaultdict(lambda: collections.defaultdict(int))
+    flat_re = re.compile(r'^(?P<proxy>.+?)[\,:/|#]\s*(?P<status>\d{3})$')
+
+    def add(proxy, status, count):
+        """Safely add count to matrix"""
+        if not proxy or not status:
+            return
+        try:
+            status_str = str(status).strip()
+            count_int = int(count)
+            if count_int > 0:
+                matrix[proxy][status_str] += count_int
+        except (ValueError, TypeError) as e:
+            print(f"Warning: Failed to add {proxy}/{status}/{count}: {e}", file=sys.stderr)
+
+    def process_dim(dim, parent_proxy=None):
+        name = dim.get("name", "")
+        ind = dim.get("individualNames")
+        subdims = dim.get("dimensions")
+
+        # Case 1: individualNames → [proxy, status]
+        if ind and len(ind) >= 2:
+            proxy = str(ind[0]).strip()
+            status = str(ind[1]).strip()
+            total = 0
+            for m in iter_metrics(dim):
+                if m.get("name") == "sum(message_count)":
+                    for v in m.get("values", []):
+                        try:
+                            total += int(v.get("value", 0))
+                        except (ValueError, TypeError):
+                            pass
+            add(proxy, status, total)
+            return
+
+        # Case 2: nested structure (proxy -> status)
+        if subdims:
+            proxy_name = name or parent_proxy or "<unknown>"
+            for sub in subdims:
+                process_dim(sub, parent_proxy=proxy_name)
+            return
+
+        # Case 3: flat "Proxy,200" or "Proxy:200"
+        m = flat_re.match(name)
+        if m:
+            proxy = m.group("proxy").strip()
+            status = m.group("status").strip()
+            total = 0
+            for metr in iter_metrics(dim):
+                if metr.get("name") == "sum(message_count)":
+                    for v in metr.get("values", []):
+                        try:
+                            total += int(v.get("value", 0))
+                        except (ValueError, TypeError):
+                            pass
+            add(proxy, status, total)
+            return
+
+        # Case 4: direct status under parent proxy
+        if parent_proxy and name.isdigit():
+            total = 0
+            for m in iter_metrics(dim):
+                if m.get("name") == "sum(message_count)":
+                    for v in m.get("values", []):
+                        try:
+                            total += int(v.get("value", 0))
+                        except (ValueError, TypeError):
+                            pass
+            add(parent_proxy, name, total)
+
+    for env in obj.get("environments", []):
+        for dim in env.get("dimensions", []):
+            process_dim(dim)
+
+    return matrix
+
+# Load data
+succ = extract_totals(load_json(succ_path))
+err = extract_totals(load_json(err_path))
+status_matrix = extract_status_matrix(load_json(status_path))
+
+# Define status codes to track
+fixed_codes = ["400", "401", "403", "404", "409", "412", "429", "500", "502", "503", "504"]
+
+# Get all unique proxies
+proxies = sorted(set(list(succ.keys()) + list(err.keys()) + list(status_matrix.keys())))
+
+def sum_family(exact, start, end):
+    """Sum all status codes in a range"""
+    total = 0
+    for k, v in exact.items():
+        try:
+            if k.isdigit() and start <= int(k) <= end:
+                total += int(v)
+        except (ValueError, TypeError):
+            pass
+    return total
+
+def safe_int(val):
+    """Safely convert value to int"""
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return 0
+
+# Prepare CSV header
+csv_header = [
+    "Date Range", "API Proxy", "Total Requests", "Total Success", "Total Errors", "4xx",
+    "400", "401", "403", "404", "409", "412", "429",
+    "5xx", "500", "502", "503", "504",
+    "Success Rate", "Error Business Rate", "Error Rate"
+]
+
+rows_html = []
+
+with open(csv_out, "w", newline="", encoding="utf-8") as fcsv:
+    writer = csv.writer(fcsv)
+    writer.writerow(csv_header)
+
+    for proxy in proxies:
+        # Get status code dictionary for this proxy
+        exact = status_matrix.get(proxy, {})
+
+        # Calculate sums by family
+        sum_2xx = sum_family(exact, 200, 299)
+        sum_4xx = sum_family(exact, 400, 499)
+        sum_5xx = sum_family(exact, 500, 599)
+
+        # Fallback to totals if no detailed status codes
+        if (sum_2xx + sum_4xx + sum_5xx) == 0:
+            sum_2xx = succ.get(proxy, 0)
+            sum_5xx = err.get(proxy, 0)
+
+        total_requests = sum_2xx + sum_4xx + sum_5xx
+        total_success = sum_2xx
+        total_errors = sum_5xx
+
+        # Calculate rates
+        success_rate = (total_success * 100.0 / total_requests) if total_requests else 0.0
+        error_rate = (total_errors * 100.0 / total_requests) if total_requests else 0.0
+        error_business_rate = (sum_4xx * 100.0 / total_requests) if total_requests else 0.0
+
+        # Get individual status code counts
+        code_400 = safe_int(exact.get("400", 0))
+        code_401 = safe_int(exact.get("401", 0))
+        code_403 = safe_int(exact.get("403", 0))
+        code_404 = safe_int(exact.get("404", 0))
+        code_409 = safe_int(exact.get("409", 0))
+        code_412 = safe_int(exact.get("412", 0))
+        code_429 = safe_int(exact.get("429", 0))
+        code_500 = safe_int(exact.get("500", 0))
+        code_502 = safe_int(exact.get("502", 0))
+        code_503 = safe_int(exact.get("503", 0))
+        code_504 = safe_int(exact.get("504", 0))
+
+        # Build CSV row
+        row = [
+            date_range, proxy, total_requests, total_success, total_errors, sum_4xx,
+            code_400, code_401, code_403, code_404, code_409, code_412, code_429,
+            sum_5xx, code_500, code_502, code_503, code_504,
+            f"{success_rate:.2f}%", f"{error_business_rate:.2f}%", f"{error_rate:.2f}%"
+        ]
+        writer.writerow(row)
+
+        # Build HTML row
+        color_sr = "#c8e6c9"  # green
+        color_er = "#ffcdd2"  # red
+
+        html_row = f"""<tr>
+<td>{html_module.escape(date_range)}</td>
+<td>{html_module.escape(proxy)}</td>
+<td align='right'>{total_requests:,}</td>
+<td align='right'>{total_success:,}</td>
+<td align='right'>{total_errors:,}</td>
+<td align='right'>{sum_4xx:,}</td>
+<td align='right'>{code_400:,}</td>
+<td align='right'>{code_401:,}</td>
+<td align='right'>{code_403:,}</td>
+<td align='right'>{code_404:,}</td>
+<td align='right'>{code_409:,}</td>
+<td align='right'>{code_412:,}</td>
+<td align='right'>{code_429:,}</td>
+<td align='right'>{sum_5xx:,}</td>
+<td align='right'>{code_500:,}</td>
+<td align='right'>{code_502:,}</td>
+<td align='right'>{code_503:,}</td>
+<td align='right'>{code_504:,}</td>
+<td align='right' style='background:{color_sr}'>{success_rate:.2f}%</td>
+<td align='right' style='background:#fff59d'>{error_business_rate:.2f}%</td>
+<td align='right' style='background:{color_er}'>{error_rate:.2f}%</td>
+</tr>"""
+
+        rows_html.append(html_row)
+
+# Generate HTML document
+html_doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Apigee Daily Report - {html_module.escape(date_range)}</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 30px; color: #2c3e50; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 11px; }}
+th, td {{ border: 1px solid #ddd; padding: 8px; }}
+th {{ background-color: #007BFF; color: white; }}
+tr:nth-child(even) {{ background-color: #f9f9f9; }}
+</style>
+</head>
+<body>
+<p>Hello Apigee_ops team,</p>
+<h2>Apigee Daily Report</h2>
+<p><b>Date Range:</b> {html_module.escape(date_range)}</p>
+<table>
+<tr>
+<th>Date Range</th><th>API Proxy</th><th>Total Requests</th><th>Total Success</th><th>Total Errors</th>
+<th>4xx</th><th>400</th><th>401</th><th>403</th><th>404</th><th>409</th><th>412</th><th>429</th>
+<th>5xx</th><th>500</th><th>502</th><th>503</th><th>504</th>
+<th>Success Rate</th><th>Business Error Rate</th><th>Error Rate</th>
+</tr>
+{''.join(rows_html)}
+</table>
+<p><b>Total Proxies:</b> {len(proxies)}</p>
+<p>Best Regards,<br><b>APIGEE OPS Automation</b></p>
+</body>
+</html>
+"""
+
+with open(html_out, "w", encoding="utf-8") as f:
+    f.write(html_doc)
+
+print("✅ CSV and HTML generated successfully.")
+PYTHON_SCRIPT
+
+# === EMAIL SEND ===
+MAIL_SUBJECT="Apigee Report ${YESTERDAY} -- ${TODAY}"
+FROM_ADDR="APIGEEOPS@ooredoo.dz"
+TO_ADDR="APIGEEOPS@ooredoo.dz"
+
+{
+echo "From: ${FROM_ADDR}"
+echo "To: ${TO_ADDR}"
+echo "Subject: ${MAIL_SUBJECT}"
+echo "MIME-Version: 1.0"
+echo "Content-Type: multipart/mixed; boundary=\"BOUNDARY\""
+echo
+echo "--BOUNDARY"
+echo "Content-Type: text/html; charset=UTF-8"
+echo "Content-Transfer-Encoding: 7bit"
+echo
+cat "$HTML_FILE"
+echo
+echo "--BOUNDARY"
+echo "Content-Type: text/csv; name=\"apigee_report.csv\""
+echo "Content-Transfer-Encoding: base64"
+echo "Content-Disposition: attachment; filename=\"apigee_report.csv\""
+echo
+base64 "$CSV_FILE"
+echo "--BOUNDARY--"
+} | sendmail -t
+
+echo "📤 Email sent with HTML body and CSV attachment."
